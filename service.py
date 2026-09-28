@@ -159,8 +159,22 @@ def main():
     import redis
     if os.environ.get("DY_INTERNAL_CALLBACK_CONFIRMED") != "1":
         raise RuntimeError("Configure internal-only callbacks before enabling this service")
-    database = redis.Redis.from_url(os.environ["REDIS_URL"], decode_responses=True,
-                                   socket_timeout=5, socket_connect_timeout=5)
+    redis_url = os.environ.get("REDIS_URL")
+    if redis_url:
+        database = redis.Redis.from_url(redis_url, decode_responses=True,
+                                        socket_timeout=5, socket_connect_timeout=5)
+    else:
+        address = os.environ.get("REDIS_ADDRESS")
+        username = os.environ.get("REDIS_USERNAME", "default")
+        password = os.environ.get("REDIS_PASSWORD")
+        if not address or not password:
+            raise RuntimeError("REDIS_ADDRESS/REDIS_PASSWORD required")
+        host, separator, port_text = address.rpartition(":")
+        if not separator:
+            host, port_text = address, "6379"
+        database = redis.Redis(host=host, port=int(port_text), username=username,
+                               password=password, decode_responses=True,
+                               socket_timeout=5, socket_connect_timeout=5)
     database.ping()
     store = RedisOutbox(database, os.environ["DY_ENV"])
     relay = Relay(store, os.environ["DY_CALLBACK_SOURCE"], os.environ["DY_ENV"])
