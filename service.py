@@ -164,7 +164,10 @@ class Relay:
         return 404, {"ok": False}
 
     def push(self, anchor, event):
-        response = self.post(PUSH_URL, event, {"X-TT-WS-OPENIDS": json.dumps([anchor])})
+        # The gateway documents extra_data, not arbitrary top-level fields.
+        payload = {key: event[key] for key in ("msg_id", "msg_type", "data")}
+        payload["extra_data"] = json.dumps({"room_id": event["room_id"]}, separators=(",", ":"))
+        response = self.post(PUSH_URL, payload, {"X-TT-WS-OPENIDS": json.dumps([anchor])})
         # Keep unknown response formats pending until real cloud response is verified.
         if not isinstance(response, dict) or type(response.get("err_no")) is not int or response["err_no"] != 0:
             raise RuntimeError("gateway acceptance not verified")
