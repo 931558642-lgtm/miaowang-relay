@@ -1,7 +1,25 @@
 import json
 import unittest
 import fakeredis
-from service import APP_ID, RedisOutbox, Relay, encode_event
+from service import APP_ID, RedisOutbox, Relay, encode_event, resolve_environment
+
+
+class EnvironmentTests(unittest.TestCase):
+    def test_system_environment_needs_no_custom_duplicate(self):
+        self.assertEqual(resolve_environment({"CLOUD_ENV": "DEV"}), "dev")
+        self.assertEqual(resolve_environment({"CLOUD_ENV": "PROD"}), "prod")
+
+    def test_legacy_explicit_environment(self):
+        self.assertEqual(resolve_environment({"DY_ENV": "dev"}), "dev")
+
+    def test_cross_environment_configuration_rejected(self):
+        with self.assertRaises(ValueError):
+            resolve_environment({"CLOUD_ENV": "PROD", "DY_ENV": "dev"})
+
+    def test_missing_or_invalid_environment_rejected(self):
+        for config in ({}, {"CLOUD_ENV": "preview"}, {"DY_ENV": "unknown"}):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                resolve_environment(config)
 
 
 class RelayTests(unittest.TestCase):
