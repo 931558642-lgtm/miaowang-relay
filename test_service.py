@@ -45,7 +45,8 @@ class RelayTests(unittest.TestCase):
         self.assertEqual([c[1]["msg_id"] for c in self.calls], ["m1", "m2"])
         self.assertTrue(all(len(json.loads(c[1]["data"])) == 1 for c in self.calls))
         self.assertTrue(json.loads(self.calls[0][1]["data"])[0]["test"])
-        self.assertEqual(self.calls[0][1]["room_id"], "room1")
+        self.assertEqual(json.loads(self.calls[0][1]["extra_data"])["room_id"], "room1")
+        self.assertNotIn("room_id", self.calls[0][1])
 
     def test_retry_does_not_duplicate_outbox(self):
         self.callback([self.gift]); self.callback([self.gift])
