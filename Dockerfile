@@ -3,6 +3,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY service.py .
+RUN mkdir -p /opt/application && printf '#!/bin/sh\nset -eu\nexec /usr/local/bin/python -u /app/service.py\n' > /opt/application/run.sh && chmod 755 /opt/application/run.sh
 USER 65532:65532
 EXPOSE 8000
-CMD ["python", "-u", "service.py"]
+CMD ["/opt/application/run.sh"]
