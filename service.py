@@ -151,7 +151,11 @@ class Relay:
     def push(self, anchor, event):
         response = self.post(PUSH_URL, event, {"X-TT-WS-OPENIDS": json.dumps([anchor])})
         # Keep unknown response formats pending until real cloud response is verified.
-        if response.get("err_no") != 0:
+        if not isinstance(response, dict) or type(response.get("err_no")) is not int or response["err_no"] != 0:
+            raise RuntimeError("gateway acceptance not verified")
+        data = response.get("data")
+        # Only an explicit empty failure list permits removal from the outbox.
+        if not isinstance(data, dict) or data.get("failed_open_id_list") != []:
             raise RuntimeError("gateway acceptance not verified")
 
 
