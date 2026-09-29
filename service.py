@@ -19,6 +19,21 @@ PUSH_URL = "http://ws-push.dyc.ivolces.com/ws/live_interaction/push_data"
 MAX_BODY = 1048576
 
 
+def resolve_environment(environ):
+    cloud = environ.get("CLOUD_ENV", "").strip().lower()
+    custom = environ.get("DY_ENV", "").strip().lower()
+    if cloud and cloud not in ("dev", "prod"):
+        raise ValueError("invalid CLOUD_ENV")
+    if custom and custom not in ("dev", "prod"):
+        raise ValueError("invalid DY_ENV")
+    if cloud and custom and cloud != custom:
+        raise ValueError("cloud and application environments differ")
+    environment = cloud or custom
+    if not environment:
+        raise ValueError("cloud environment required")
+    return environment
+
+
 def identifier(value, maximum=512):
     return isinstance(value, str) and 0 < len(value) <= maximum and not any(ord(c) < 32 for c in value)
 
@@ -154,6 +169,7 @@ class Relay:
         if not isinstance(response, dict) or type(response.get("err_no")) is not int or response["err_no"] != 0:
             raise RuntimeError("gateway acceptance not verified")
         data = response.get("data")
+        # The gateway can report recipient failures even when err_no is zero.
         # Only an explicit empty failure list permits removal from the outbox.
         if not isinstance(data, dict) or data.get("failed_open_id_list") != []:
             raise RuntimeError("gateway acceptance not verified")
@@ -180,8 +196,9 @@ def main():
                                password=password, decode_responses=True,
                                socket_timeout=5, socket_connect_timeout=5)
     database.ping()
-    store = RedisOutbox(database, os.environ["DY_ENV"])
-    relay = Relay(store, os.environ["DY_CALLBACK_SOURCE"], os.environ["DY_ENV"])
+    environment = resolve_environment(os.environ)
+    store = RedisOutbox(database, environment)
+    relay = Relay(store, os.environ["DY_CALLBACK_SOURCE"], environment)
     stop = threading.Event()
 
     def worker():
@@ -234,4 +251,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
