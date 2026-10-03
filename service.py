@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 APP_ID = "tt19616fdc8719e41710"
 TYPES = ("live_comment", "live_like", "live_gift")
 TASK_URL = "http://webcast-bytedance-com.openapi.dyc.ivolces.com/api/live_data/task/start"
+STOP_TASK_URL = "http://webcast-bytedance-com.openapi.dyc.ivolces.com/api/live_data/task/stop"
 PUSH_URL = "http://ws-push.dyc.ivolces.com/ws/live_interaction/push_data"
 MAX_BODY = 1048576
 
@@ -121,10 +122,23 @@ class RedisOutbox:
 
 
 class Relay:
-    def __init__(self, store, callback_source, environment, post=post_json):
+    def __init__(self, store, callback_source, environment, post=post_json, diagnostic=None):
         if not callback_source or environment not in ("dev", "prod"):
             raise ValueError("verified callback source and environment required")
         self.store, self.source, self.environment, self.post = store, callback_source, environment, post
+        self.diagnostic = diagnostic
+
+    def record_tasks(self, operation, results, errors):
+        # Only fixed names, booleans and integer error codes. No response text,
+        # room, anchor, audience, token, key or raw callback enters this record.
+        if self.diagnostic is not None:
+            try:
+                self.diagnostic({"event": "tasks_" + operation, "tasks": results,
+                                 "errors": errors, "environment": self.environment})
+            except Exception:
+                # Diagnostic output cannot turn completed task operations into
+                # a false failure. No request body or secret is used to recover.
+                pass
 
     def route(self, path, headers, body):
         if path == "/healthz":
@@ -149,13 +163,24 @@ class Relay:
         # These identity headers must be injected by the authenticated cloud gateway.
         if headers.get("x-tt-appid") != APP_ID or not identifier(headers.get("x-room-id"), 256) or not identifier(headers.get("x-anchor-openid")):
             return 403, {"ok": False, "reason": "gateway identity"}
-        if path == "/start_game":
-            result = {}
+        if path in ("/start_game", "/stop_game"):
+            # Both task operations are platform-idempotent. Never cache success:
+            # partial failure or a lost response can safely retry all three types.
+            url = TASK_URL if path == "/start_game" else STOP_TASK_URL
+            result, errors = {}, {}
             for kind in TYPES:
-                response = self.post(TASK_URL, {"appid": APP_ID, "roomid": headers["x-room-id"], "msg_type": kind})
-                result[kind] = response.get("err_no") == 0
+                try:
+                    response = self.post(url, {"appid": APP_ID, "roomid": headers["x-room-id"], "msg_type": kind})
+                    result[kind] = (isinstance(response, dict) and
+                                    type(response.get("err_no")) is int and response["err_no"] == 0)
+                    errors[kind] = response["err_no"] if isinstance(response, dict) and type(response.get("err_no")) is int else None
+                except Exception:
+                    # Still attempt the other types, without logging credentials.
+                    result[kind] = False
+                    errors[kind] = None
             ok = all(result.values())
-            return (200 if ok else 502), {"ok": ok, "tasks": result}
+            self.record_tasks("start" if path == "/start_game" else "stop", result, errors)
+            return (200 if ok else 502), {"ok": ok, "tasks": result, "errors": errors}
         if path == "/websocket_callback":
             if headers.get("x-tt-event-type") not in ("connect", "disconnect", "uplink"):
                 return 400, {"ok": False}
@@ -178,45 +203,19 @@ class Relay:
             raise RuntimeError("gateway acceptance not verified")
 
 
-def main():
-    import redis
-    if os.environ.get("DY_INTERNAL_CALLBACK_CONFIRMED") != "1":
-        raise RuntimeError("Configure internal-only callbacks before enabling this service")
-    redis_url = os.environ.get("REDIS_URL")
-    if redis_url:
-        database = redis.Redis.from_url(redis_url, decode_responses=True,
-                                        socket_timeout=5, socket_connect_timeout=5)
-    else:
-        address = os.environ.get("REDIS_ADDRESS")
-        username = os.environ.get("REDIS_USERNAME", "default")
-        password = os.environ.get("REDIS_PASSWORD")
-        if not address or not password:
-            raise RuntimeError("REDIS_ADDRESS/REDIS_PASSWORD required")
-        host, separator, port_text = address.rpartition(":")
-        if not separator:
-            host, port_text = address, "6379"
-        database = redis.Redis(host=host, port=int(port_text), username=username,
-                               password=password, decode_responses=True,
-                               socket_timeout=5, socket_connect_timeout=5)
-    database.ping()
-    environment = resolve_environment(os.environ)
-    store = RedisOutbox(database, environment)
-    relay = Relay(store, os.environ["DY_CALLBACK_SOURCE"], environment)
-    stop = threading.Event()
-
-    def worker():
-        while not stop.is_set():
-            try:
-                if store.drain_one(relay.push):
-                    continue
-            except Exception as exc:
-                # Never log request bodies, tokens, audience identifiers, or Redis URL.
-                print("outbox_retry", type(exc).__name__, flush=True)
-            stop.wait(1)
-
+def create_handler(relay):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
+
+        def do_HEAD(self):
+            # Liveness only: no body parsing, Redis access, or task/callback routing.
+            # A health probe must never start/stop tasks or accept audience input.
+            self.send_response(200 if self.path == "/healthz" else 405)
+            self.send_header("Content-Length", "0")
+            if self.path != "/healthz":
+                self.send_header("Allow", "GET, POST")
+            self.end_headers()
 
         def do_GET(self):
             self.do_POST()
@@ -243,8 +242,48 @@ def main():
             self.end_headers()
             self.wfile.write(payload)
 
+    return Handler
+
+
+def main():
+    import redis
+    if os.environ.get("DY_INTERNAL_CALLBACK_CONFIRMED") != "1":
+        raise RuntimeError("Configure internal-only callbacks before enabling this service")
+    redis_url = os.environ.get("REDIS_URL")
+    if redis_url:
+        database = redis.Redis.from_url(redis_url, decode_responses=True,
+                                        socket_timeout=5, socket_connect_timeout=5)
+    else:
+        address = os.environ.get("REDIS_ADDRESS")
+        username = os.environ.get("REDIS_USERNAME", "default")
+        password = os.environ.get("REDIS_PASSWORD")
+        if not address or not password:
+            raise RuntimeError("REDIS_ADDRESS/REDIS_PASSWORD required")
+        host, separator, port_text = address.rpartition(":")
+        if not separator:
+            host, port_text = address, "6379"
+        database = redis.Redis(host=host, port=int(port_text), username=username,
+                               password=password, decode_responses=True,
+                               socket_timeout=5, socket_connect_timeout=5)
+    database.ping()
+    environment = resolve_environment(os.environ)
+    store = RedisOutbox(database, environment)
+    relay = Relay(store, os.environ["DY_CALLBACK_SOURCE"], environment,
+                  diagnostic=lambda record: print(json.dumps(record, separators=(",", ":")), flush=True))
+    stop = threading.Event()
+
+    def worker():
+        while not stop.is_set():
+            try:
+                if store.drain_one(relay.push):
+                    continue
+            except Exception as exc:
+                # Never log request bodies, tokens, audience identifiers, or Redis URL.
+                print("outbox_retry", type(exc).__name__, flush=True)
+            stop.wait(1)
+
     threading.Thread(target=worker, daemon=True).start()
-    server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8000"))), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8000"))), create_handler(relay))
     try:
         server.serve_forever()
     finally:
@@ -254,3 +293,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
