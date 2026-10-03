@@ -209,11 +209,12 @@ def create_handler(relay):
             pass
 
         def do_HEAD(self):
-            # Liveness only: no body parsing, Redis access, or task/callback routing.
-            # A health probe must never start/stop tasks or accept audience input.
-            self.send_response(200 if self.path == "/healthz" else 405)
+            # Platform domain validation and liveness only: no body parsing,
+            # Redis access, or task/callback routing. POST authentication is unchanged.
+            probe = self.path in ("/", "/healthz", "/live_data_callback")
+            self.send_response(200 if probe else 405)
             self.send_header("Content-Length", "0")
-            if self.path != "/healthz":
+            if not probe:
                 self.send_header("Allow", "GET, POST")
             self.end_headers()
 
