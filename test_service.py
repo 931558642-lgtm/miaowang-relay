@@ -261,12 +261,14 @@ class HeadProbeTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_health_head_is_empty_and_does_not_touch_routes_or_body(self):
-        self.assertEqual(self.head("/healthz"), (200, b""))
+    def test_probe_head_is_empty_and_does_not_touch_routes_or_body(self):
+        for path in ("/", "/healthz", "/live_data_callback"):
+            with self.subTest(path=path):
+                self.assertEqual(self.head(path), (200, b""))
         self.assertEqual(self.routes, [])
 
-    def test_head_cannot_start_stop_or_accept_callback(self):
-        for path in ("/start_game", "/stop_game", "/live_data_callback", "/websocket_callback", "/"):
+    def test_head_cannot_start_stop_or_access_unknown_routes(self):
+        for path in ("/start_game", "/stop_game", "/websocket_callback", "/unknown"):
             with self.subTest(path=path):
                 self.assertEqual(self.head(path), (405, b""))
         self.assertEqual(self.routes, [])
