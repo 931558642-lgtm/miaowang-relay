@@ -1,7 +1,10 @@
 import json
+import threading
 import unittest
+from http.client import HTTPConnection
+from http.server import ThreadingHTTPServer
 import fakeredis
-from service import APP_ID, RedisOutbox, Relay, encode_event, resolve_environment
+from service import APP_ID, STOP_TASK_URL, RedisOutbox, Relay, create_handler, encode_event, resolve_environment
 
 
 class EnvironmentTests(unittest.TestCase):
@@ -119,6 +122,97 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(self.relay.route("/start_game", self.headers, {})[0], 200)
         self.assertEqual([c[1]["msg_type"] for c in self.calls], ["live_comment", "live_like", "live_gift"])
 
+    def test_task_stop_can_repeat_without_changing_identity_or_queue(self):
+        self.callback([self.gift])
+        before = self.redis.lrange(self.store.queue, 0, -1)
+        for _ in range(2):
+            code, body = self.relay.route("/stop_game", self.headers, {})
+            self.assertEqual(code, 200)
+            self.assertTrue(body["ok"])
+        self.assertEqual([c[0] for c in self.calls], [STOP_TASK_URL] * 6)
+        expected = [{"appid": APP_ID, "roomid": "room1", "msg_type": kind}
+                    for kind in ("live_comment", "live_like", "live_gift")] * 2
+        self.assertEqual([c[1] for c in self.calls], expected)
+        self.assertEqual(self.redis.lrange(self.store.queue, 0, -1), before)
+
+    def test_task_stop_partial_failure_reports_failure_and_retries_all_types(self):
+        def partial(url, data, headers=None):
+            self.calls.append((url, data, headers))
+            return {"err_no": 10001 if data["msg_type"] == "live_like" else 0}
+        self.relay.post = partial
+        code, body = self.relay.route("/stop_game", self.headers, {})
+        self.assertEqual(code, 502)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["tasks"], {"live_comment": True, "live_like": False, "live_gift": True})
+        self.relay.post = lambda url, data, headers=None: (
+            self.calls.append((url, data, headers)) or {"err_no": 0})
+        self.assertTrue(self.relay.route("/stop_game", self.headers, {})[1]["ok"])
+        self.assertEqual(len(self.calls), 6)
+
+    def test_task_stop_transport_failure_still_attempts_remaining_types(self):
+        def timeout(url, data, headers=None):
+            self.calls.append((url, data, headers))
+            if data["msg_type"] == "live_comment":
+                raise TimeoutError()
+            return {"err_no": 0}
+        self.relay.post = timeout
+        code, body = self.relay.route("/stop_game", self.headers, {})
+        self.assertEqual(code, 502)
+        self.assertFalse(body["ok"])
+        self.assertEqual(len(self.calls), 3)
+        self.assertTrue(body["tasks"]["live_gift"])
+
+    def test_task_diagnostics_preserve_codes_and_omit_private_values(self):
+        records = []
+        self.relay.diagnostic = records.append
+        self.relay.post = lambda url, data, headers=None: {
+            "err_no": 20001 if data["msg_type"] == "live_comment" else 0,
+            "err_msg": "do-not-save-private-response",
+            "token": "do-not-save-token"}
+        status, body = self.relay.route("/start_game", self.headers, {})
+        self.assertEqual(status, 502)
+        self.assertEqual(body["errors"], {"live_comment": 20001, "live_like": 0, "live_gift": 0})
+        self.assertEqual(records[0]["tasks"], body["tasks"])
+        raw = json.dumps(records)
+        for private in ("do-not-save", "room1", "anchor1", "err_msg", "token"):
+            self.assertNotIn(private, raw)
+
+    def test_task_diagnostics_use_null_for_ambiguous_or_transport_results(self):
+        def post(url, data, headers=None):
+            if data["msg_type"] == "live_comment":
+                raise TimeoutError()
+            return {"err_no": False}
+        self.relay.post = post
+        status, body = self.relay.route("/start_game", self.headers, {})
+        self.assertEqual(status, 502)
+        self.assertEqual(body["errors"], dict.fromkeys(("live_comment", "live_like", "live_gift")))
+        self.assertFalse(any(body["tasks"].values()))
+
+    def test_diagnostic_sink_failure_cannot_change_task_outcome(self):
+        def broken_sink(record):
+            raise OSError("fixture log writer is unavailable")
+        self.relay.diagnostic = broken_sink
+        status, body = self.relay.route("/start_game", self.headers, {})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+
+    def test_task_operations_reject_ambiguous_success_responses(self):
+        for path in ("/start_game", "/stop_game"):
+            for response in (None, [], {}, {"err_no": False}, {"err_no": "0"}, {"err_no": 0.0}):
+                with self.subTest(path=path, response=response):
+                    self.relay.post = lambda *args: response
+                    code, body = self.relay.route(path, self.headers, {})
+                    self.assertEqual(code, 502)
+                    self.assertFalse(body["ok"])
+
+    def test_task_stop_requires_gateway_identity(self):
+        for field in ("x-tt-appid", "x-room-id", "x-anchor-openid"):
+            headers = dict(self.headers)
+            del headers[field]
+            with self.subTest(field=field):
+                self.assertEqual(self.relay.route("/stop_game", headers, {})[0], 403)
+        self.assertEqual(self.calls, [])
+
     def test_client_uplink_cannot_inject_gifts(self):
         self.headers["x-tt-event-type"] = "uplink"
         self.assertEqual(self.relay.route("/websocket_callback", self.headers, [self.gift])[0], 200)
@@ -140,5 +234,44 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 
+class HeadProbeTests(unittest.TestCase):
+    def setUp(self):
+        self.routes = []
+        class NoRouteRelay:
+            def route(inner, *args):
+                self.routes.append(args)
+                raise AssertionError("HEAD must not invoke application routes")
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), create_handler(NoRouteRelay()))
+        self.worker = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.worker.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.worker.join(timeout=2)
+
+    def head(self, path):
+        connection = HTTPConnection("127.0.0.1", self.server.server_port, timeout=2)
+        try:
+            connection.request("HEAD", path, headers={"Content-Length": "9999"})
+            response = connection.getresponse()
+            result = response.status, response.read()
+            self.assertEqual(response.getheader("Content-Length"), "0")
+            return result
+        finally:
+            connection.close()
+
+    def test_health_head_is_empty_and_does_not_touch_routes_or_body(self):
+        self.assertEqual(self.head("/healthz"), (200, b""))
+        self.assertEqual(self.routes, [])
+
+    def test_head_cannot_start_stop_or_accept_callback(self):
+        for path in ("/start_game", "/stop_game", "/live_data_callback", "/websocket_callback", "/"):
+            with self.subTest(path=path):
+                self.assertEqual(self.head(path), (405, b""))
+        self.assertEqual(self.routes, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
