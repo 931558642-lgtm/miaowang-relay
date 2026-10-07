@@ -118,9 +118,9 @@ class RelayTests(unittest.TestCase):
         code, body = self.relay.route("/start_game", self.headers, {})
         self.assertEqual(code, 502); self.assertFalse(body["ok"])
 
-    def test_task_start_opens_only_three_required_types(self):
+    def test_task_start_opens_four_required_types(self):
         self.assertEqual(self.relay.route("/start_game", self.headers, {})[0], 200)
-        self.assertEqual([c[1]["msg_type"] for c in self.calls], ["live_comment", "live_like", "live_gift"])
+        self.assertEqual([c[1]["msg_type"] for c in self.calls], ["live_comment", "live_like", "live_gift", "live_follow"])
 
     def test_task_stop_can_repeat_without_changing_identity_or_queue(self):
         self.callback([self.gift])
@@ -129,9 +129,9 @@ class RelayTests(unittest.TestCase):
             code, body = self.relay.route("/stop_game", self.headers, {})
             self.assertEqual(code, 200)
             self.assertTrue(body["ok"])
-        self.assertEqual([c[0] for c in self.calls], [STOP_TASK_URL] * 6)
+        self.assertEqual([c[0] for c in self.calls], [STOP_TASK_URL] * 8)
         expected = [{"appid": APP_ID, "roomid": "room1", "msg_type": kind}
-                    for kind in ("live_comment", "live_like", "live_gift")] * 2
+                    for kind in ("live_comment", "live_like", "live_gift", "live_follow")] * 2
         self.assertEqual([c[1] for c in self.calls], expected)
         self.assertEqual(self.redis.lrange(self.store.queue, 0, -1), before)
 
@@ -143,11 +143,11 @@ class RelayTests(unittest.TestCase):
         code, body = self.relay.route("/stop_game", self.headers, {})
         self.assertEqual(code, 502)
         self.assertFalse(body["ok"])
-        self.assertEqual(body["tasks"], {"live_comment": True, "live_like": False, "live_gift": True})
+        self.assertEqual(body["tasks"], {"live_comment": True, "live_like": False, "live_gift": True, "live_follow": True})
         self.relay.post = lambda url, data, headers=None: (
             self.calls.append((url, data, headers)) or {"err_no": 0})
         self.assertTrue(self.relay.route("/stop_game", self.headers, {})[1]["ok"])
-        self.assertEqual(len(self.calls), 6)
+        self.assertEqual(len(self.calls), 8)
 
     def test_task_stop_transport_failure_still_attempts_remaining_types(self):
         def timeout(url, data, headers=None):
@@ -159,7 +159,7 @@ class RelayTests(unittest.TestCase):
         code, body = self.relay.route("/stop_game", self.headers, {})
         self.assertEqual(code, 502)
         self.assertFalse(body["ok"])
-        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(len(self.calls), 4)
         self.assertTrue(body["tasks"]["live_gift"])
 
     def test_task_diagnostics_preserve_codes_and_omit_private_values(self):
@@ -171,7 +171,7 @@ class RelayTests(unittest.TestCase):
             "token": "do-not-save-token"}
         status, body = self.relay.route("/start_game", self.headers, {})
         self.assertEqual(status, 502)
-        self.assertEqual(body["errors"], {"live_comment": 20001, "live_like": 0, "live_gift": 0})
+        self.assertEqual(body["errors"], {"live_comment": 20001, "live_like": 0, "live_gift": 0, "live_follow": 0})
         self.assertEqual(records[0]["tasks"], body["tasks"])
         raw = json.dumps(records)
         for private in ("do-not-save", "room1", "anchor1", "err_msg", "token"):
@@ -185,7 +185,7 @@ class RelayTests(unittest.TestCase):
         self.relay.post = post
         status, body = self.relay.route("/start_game", self.headers, {})
         self.assertEqual(status, 502)
-        self.assertEqual(body["errors"], dict.fromkeys(("live_comment", "live_like", "live_gift")))
+        self.assertEqual(body["errors"], dict.fromkeys(("live_comment", "live_like", "live_gift", "live_follow")))
         self.assertFalse(any(body["tasks"].values()))
 
     def test_diagnostic_sink_failure_cannot_change_task_outcome(self):
