@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 
 APP_ID = "tt19616fdc8719e41710"
-TYPES = ("live_comment", "live_like", "live_gift", "live_follow")
+TYPES = ("live_comment", "live_like", "live_gift", "live_follow", "live_fansclub")
 TASK_URL = "http://webcast-bytedance-com.openapi.dyc.ivolces.com/api/live_data/task/start"
 STOP_TASK_URL = "http://webcast-bytedance-com.openapi.dyc.ivolces.com/api/live_data/task/stop"
 PUSH_URL = "http://ws-push.dyc.ivolces.com/ws/live_interaction/push_data"
@@ -53,6 +53,8 @@ def encode_event(room, kind, row):
         raise ValueError("missing gift identity")
     if kind == 'live_follow' and (type(row.get('user_follow_action')) is not int or row['user_follow_action'] not in (1, 2, 3)):
         raise ValueError('invalid follow action')
+    if kind == 'live_fansclub' and (type(row.get('fansclub_reason_type')) is not int or row['fansclub_reason_type'] not in (1, 2) or type(row.get('fansclub_level')) is not int or not 1 <= row['fansclub_level'] <= 100):
+        raise ValueError('invalid fansclub event')
     for field in ("nickname", "content"):
         if field in row and (not isinstance(row[field], str) or len(row[field]) > 2048):
             raise ValueError("invalid text")
@@ -476,3 +478,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
