@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 
 APP_ID = "tt19616fdc8719e41710"
-TYPES = ("live_comment", "live_like", "live_gift")
+TYPES = ("live_comment", "live_like", "live_gift", "live_follow")
 TASK_URL = "http://webcast-bytedance-com.openapi.dyc.ivolces.com/api/live_data/task/start"
 STOP_TASK_URL = "http://webcast-bytedance-com.openapi.dyc.ivolces.com/api/live_data/task/stop"
 PUSH_URL = "http://ws-push.dyc.ivolces.com/ws/live_interaction/push_data"
@@ -51,6 +51,8 @@ def encode_event(room, kind, row):
         raise ValueError("invalid incremental count")
     if kind == "live_gift" and not identifier(row.get("sec_gift_id")):
         raise ValueError("missing gift identity")
+    if kind == 'live_follow' and (type(row.get('user_follow_action')) is not int or row['user_follow_action'] not in (1, 2, 3)):
+        raise ValueError('invalid follow action')
     for field in ("nickname", "content"):
         if field in row and (not isinstance(row[field], str) or len(row[field]) > 2048):
             raise ValueError("invalid text")
@@ -216,6 +218,54 @@ class RoomRedisOutbox(RedisOutbox):
 
 
 class Relay:
+    ROUND_WRITE = """
+    local current=tonumber(redis.call('HGET',KEYS[1],'round_id') or '0')
+    local incoming=tonumber(ARGV[1])
+    if incoming < current then return -1 end
+    if ARGV[2] == 'group' then
+      if incoming ~= current or redis.call('HGET',KEYS[1],'status') ~= '1' then return -1 end
+      redis.call('HSET',KEYS[2],ARGV[3],ARGV[4])
+    else
+      if incoming == current and redis.call('HGET',KEYS[1],'status') == '2' and ARGV[3] == '1' then return -1 end
+      if incoming > current then redis.call('DEL',KEYS[2]) end
+      redis.call('HSET',KEYS[1],'round_id',ARGV[1],'status',ARGV[3])
+    end
+    redis.call('EXPIRE',KEYS[1],2592000);redis.call('EXPIRE',KEYS[2],2592000)
+    return 1
+    """
+
+    def round_keys(self, room):
+        key = self.store.prefix + 'round:' + hashlib.sha256(room.encode()).hexdigest()
+        return key, key + ':groups'
+
+    def save_round(self, room, body):
+        if not isinstance(body, dict) or type(body.get('round_id')) is not int or not 0 < body['round_id'] < 2**53:
+            return 400, {'ok': False, 'reason': 'round identity'}
+        keys = self.round_keys(room)
+        if 'group_id' in body:
+            if body['group_id'] not in ('cat', 'dog') or not identifier(body.get('open_id')):
+                return 400, {'ok': False, 'reason': 'group identity'}
+            args = (body['round_id'], 'group', body['open_id'], body['group_id'])
+        else:
+            if type(body.get('status')) is not int or body['status'] not in (1, 2):
+                return 400, {'ok': False, 'reason': 'round status'}
+            args = (body['round_id'], 'status', body['status'])
+        result = self.store.redis.eval(self.ROUND_WRITE, 2, *keys, *args)
+        return (200, {'ok': True}) if result == 1 else (409, {'ok': False, 'reason': 'stale round'})
+
+    def query_group(self, room, body):
+        if not isinstance(body, dict) or body.get('app_id') != APP_ID or body.get('room_id') != room or not identifier(body.get('open_id')):
+            return 200, {'errcode': 40001, 'errmsg': 'invalid identity'}
+        keys = self.round_keys(room)
+        # One transaction keeps round and membership consistent during a new round.
+        with self.store.redis.pipeline(transaction=True) as pipe:
+            pipe.hgetall(keys[0]); pipe.hget(keys[1], body['open_id'])
+            state, group = pipe.execute()
+        group = group if group in ('cat', 'dog') else ''
+        return 200, {'errcode': 0, 'errmsg': 'success', 'data': {
+            'round_id': int(state.get('round_id', 0)), 'round_status': int(state.get('status', 2)),
+            'user_group_status': 1 if group else 0, 'group_id': group}}
+
     def __init__(self, store, callback_source, environment, post=post_json, diagnostic=None):
         if not callback_source or environment not in ("dev", "prod"):
             raise ValueError("verified callback source and environment required")
@@ -245,6 +295,8 @@ class Relay:
                 return 403, {"ok": False, "reason": "application"}
             room = headers.get("x-roomid") or headers.get("x-room-id")
             anchor, kind = headers.get("x-anchor-openid"), headers.get("x-msg-type")
+            if kind == 'user_group' and identifier(room, 256):
+                return self.query_group(room, body)
             if not identifier(anchor) or not identifier(room, 256) or kind not in TYPES:
                 return 400, {"ok": False, "reason": "callback headers"}
             if not isinstance(body, list) or not 1 <= len(body) <= 1000:
@@ -258,6 +310,8 @@ class Relay:
         if headers.get("x-tt-appid") != APP_ID or not identifier(headers.get("x-room-id"), 256) or not identifier(headers.get("x-anchor-openid")):
             return 403, {"ok": False, "reason": "gateway identity"}
         if path in ("/start_game", "/stop_game"):
+            if path == '/start_game' and isinstance(body, dict) and body.get('operation') == 'round_state':
+                return self.save_round(headers['x-room-id'], body)
             # Both task operations are platform-idempotent. Never cache success:
             # partial failure or a lost response can safely retry all three types.
             url = TASK_URL if path == "/start_game" else STOP_TASK_URL
