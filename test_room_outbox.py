@@ -70,6 +70,24 @@ class RoomOutboxTests(unittest.TestCase):
         self.assertEqual(raised.exception.failed_count, 1)
         self.assertNotIn('private', str(raised.exception))
 
+    def test_cloud_encoded_success_is_normalized_before_acknowledgement(self):
+        receipts = []
+        relay = Relay(self.store, 'fixture', 'dev', lambda *a: {
+            'err_no': 0, 'err_msg': 'success',
+            'data': json.dumps({'failed_open_id_list': []})}, diagnostic=receipts.append)
+        self.store.put('private-anchor', self.event('private-room', 'message'))
+        self.assertTrue(self.store.drain_one(relay.push))
+        self.assertEqual(self.db.scard(self.store.rooms), 0)
+        self.assertEqual(receipts, [{'event': 'push_receipt', 'gatewayAccepted': True,
+                                    'encodedData': True, 'clientConsumptionVerified': False}])
+
+    def test_encoded_offline_recipient_and_malformed_responses_stay_pending(self):
+        for data in [json.dumps({'failed_open_id_list': ['private-anchor']}),
+                     'invalid-json', json.dumps({}), json.dumps(None)]:
+            relay = Relay(self.store, 'fixture', 'dev', lambda *a: {'err_no': 0, 'data': data})
+            with self.assertRaises(PushRejected):
+                relay.push('private-anchor', self.event('private-room', 'private-message'))
+
 
 if __name__ == '__main__':
     unittest.main()
