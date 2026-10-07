@@ -295,7 +295,19 @@ class Relay:
         # The gateway can report recipient failures even when err_no is zero.
         # Only an explicit empty failure list permits removal from the outbox.
         if not isinstance(data, dict) or not isinstance(data.get("failed_open_id_list"), list):
-            raise PushRejected("response_shape", 0)
+            error = PushRejected("response_shape", 0)
+            # Describe only field existence/types. Never record body values or IDs.
+            error.response_shape = {
+                "dataType": type(data).__name__,
+                "hasData": "data" in response,
+                "hasFailedOpenIds": isinstance(data, dict) and "failed_open_id_list" in data,
+                "failedOpenIdsType": type(data.get("failed_open_id_list")).__name__ if isinstance(data, dict) else "absent",
+                "hasFailedSessionIds": isinstance(data, dict) and "failed_session_id_list" in data,
+                "hasFailuresAtRoot": "failed_open_id_list" in response,
+                "dataEmpty": data in (None, "", {}) if not isinstance(data, list) else not data,
+                "successMessage": response.get("err_msg") == "success",
+            }
+            raise error
         if data["failed_open_id_list"]:
             raise PushRejected("recipient_offline", 0, len(data["failed_open_id_list"]))
 
@@ -380,6 +392,8 @@ def main():
                 record = {'event': 'outbox_retry', 'exception': type(exc).__name__}
                 if isinstance(exc, PushRejected):
                     record.update(reason=exc.reason, errorCode=exc.code, failedRecipients=exc.failed_count)
+                    if hasattr(exc, "response_shape"):
+                        record["responseShape"] = exc.response_shape
                 print(json.dumps(record, separators=(',', ':')), flush=True)
             stop.wait(1)
 
