@@ -40,4 +40,13 @@ class RoundStateTests(unittest.TestCase):
             encode_event('fixture-room','live_follow',{'msg_id':'fixture','sec_openid':'fixture-user','user_follow_action':9})
         self.assertTrue(self.relay.route('/start_game',self.gateway,{})[1]['tasks']['live_follow'])
 
+    def test_fansclub_validation_and_subscription(self):
+        row={'msg_id':'fixture-fans','sec_openid':'fixture-user','fansclub_reason_type':2,'fansclub_level':1}
+        self.assertEqual(encode_event('fixture-room','live_fansclub',row)['msg_type'],'live_fansclub')
+        self.assertTrue(self.relay.route('/start_game',self.gateway,{})[1]['tasks']['live_fansclub'])
+        for value in (0,True,1.5,101):
+            with self.assertRaises(ValueError):
+                encode_event('fixture-room','live_fansclub',{**row,'fansclub_level':value})
+
 if __name__ == '__main__': unittest.main()
+
