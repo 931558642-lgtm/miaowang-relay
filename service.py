@@ -292,6 +292,14 @@ class Relay:
             code = response.get("err_no") if isinstance(response, dict) else None
             raise PushRejected("gateway_error", code if type(code) is int else None)
         data = response.get("data")
+        # Live cloud evidence: the gateway wraps this object in a JSON string.
+        # Normalize that representation, then require the same explicit receipt.
+        encoded_data = isinstance(data, str)
+        if encoded_data:
+            try:
+                data = json.loads(data)
+            except (ValueError, TypeError):
+                pass
         # The gateway can report recipient failures even when err_no is zero.
         # Only an explicit empty failure list permits removal from the outbox.
         if not isinstance(data, dict) or not isinstance(data.get("failed_open_id_list"), list):
@@ -310,6 +318,12 @@ class Relay:
             raise error
         if data["failed_open_id_list"]:
             raise PushRejected("recipient_offline", 0, len(data["failed_open_id_list"]))
+        if self.diagnostic is not None:
+            try:
+                self.diagnostic({"event": "push_receipt", "gatewayAccepted": True,
+                                 "encodedData": encoded_data, "clientConsumptionVerified": False})
+            except Exception:
+                pass
 
 
 def create_handler(relay):
