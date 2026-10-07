@@ -121,6 +121,100 @@ class RedisOutbox:
             self.redis.eval(self.UNLOCK, 1, self.lock, owner)
 
 
+class PushRejected(RuntimeError):
+    def __init__(self, reason, code=None, failed_count=0):
+        super().__init__(reason)
+        self.reason, self.code, self.failed_count = reason, code, failed_count
+
+
+class RoomRedisOutbox(RedisOutbox):
+    """Preserve old pending packets while isolating failed rooms from live rooms."""
+    MIGRATE = """
+    if redis.call('GET', KEYS[4]) ~= ARGV[2] then return 0 end
+    if redis.call('LINDEX', KEYS[1], -1) ~= ARGV[1] then return 0 end
+    redis.call('LPUSH', KEYS[3], ARGV[1])
+    if ARGV[3] == 'room' then redis.call('SADD', KEYS[2], KEYS[3]) end
+    redis.call('RPOP', KEYS[1])
+    return 1
+    """
+    ROOM_ADD = """
+    if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+    if redis.call('LLEN', KEYS[2]) >= tonumber(ARGV[2]) then return -1 end
+    redis.call('RPUSH', KEYS[2], ARGV[1])
+    redis.call('SADD', KEYS[3], KEYS[2])
+    redis.call('SET', KEYS[1], '1', 'EX', 2592000)
+    return 1
+    """
+    ROOM_POP = """
+    if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+    if redis.call('LINDEX', KEYS[2], 0) ~= ARGV[2] then return 0 end
+    redis.call('LPOP', KEYS[2])
+    if redis.call('LLEN', KEYS[2]) == 0 then redis.call('SREM', KEYS[3], KEYS[2]) end
+    return 1
+    """
+
+    def __init__(self, redis, environment):
+        super().__init__(redis, environment)
+        self.rooms = self.prefix + 'pending_rooms'
+        self.quarantine = self.prefix + 'quarantine'
+        self.cursor = 0
+
+    def room_queue(self, anchor, room):
+        identity = str(len(anchor.encode())) + ':' + anchor + room
+        return self.prefix + 'room:' + hashlib.sha1(identity.encode()).hexdigest()
+
+    def put(self, anchor, event):
+        identity = json.dumps([event['room_id'], event['msg_type'], event['msg_id']])
+        key = self.prefix + 'seen:' + hashlib.sha256(identity.encode()).hexdigest()
+        raw = json.dumps({'anchor': anchor, 'event': event}, ensure_ascii=False)
+        result = self.redis.eval(self.ROOM_ADD, 3, key, self.room_queue(anchor, event['room_id']),
+                                 self.rooms, raw, 100000)
+        if result < 0:
+            raise RuntimeError('outbox capacity reached')
+        return result
+
+    def drain_one(self, send):
+        # Reverse-transfer legacy stock so older packets prepend ahead of new
+        # packets, atomically and without a delete/reset of users' pending gifts.
+        migration_owner = str(uuid.uuid4())
+        if not self.redis.set(self.lock, migration_owner, nx=True, ex=30):
+            return False
+        try:
+            for raw in reversed(self.redis.lrange(self.queue, -128, -1)):
+                target, kind = self.quarantine, 'quarantine'
+                try:
+                    item = json.loads(raw)
+                    if identifier(item.get('anchor')) and isinstance(item.get('event'), dict) and identifier(item['event'].get('room_id')):
+                        target = self.room_queue(item['anchor'], item['event']['room_id'])
+                        kind = 'room'
+                except (ValueError, TypeError, AttributeError):
+                    pass
+                if not self.redis.eval(self.MIGRATE, 4, self.queue, self.rooms, target, self.lock, raw, migration_owner, kind):
+                    return False
+        finally:
+            self.redis.eval(self.UNLOCK, 1, self.lock, migration_owner)
+        if self.redis.llen(self.queue):
+            return False
+        queues = sorted(self.redis.smembers(self.rooms))
+        if not queues:
+            return False
+        queue = queues[self.cursor % len(queues)]
+        self.cursor += 1  # Advances even on rejection, so another room gets a turn.
+        lock = queue + ':worker'
+        owner = str(uuid.uuid4())
+        if not self.redis.set(lock, owner, nx=True, ex=30):
+            return False
+        try:
+            raw = self.redis.lindex(queue, 0)
+            if raw is None:
+                return False
+            item = json.loads(raw)
+            send(item['anchor'], item['event'])
+            return bool(self.redis.eval(self.ROOM_POP, 3, lock, queue, self.rooms, owner, raw))
+        finally:
+            self.redis.eval(self.UNLOCK, 1, lock, owner)
+
+
 class Relay:
     def __init__(self, store, callback_source, environment, post=post_json, diagnostic=None):
         if not callback_source or environment not in ("dev", "prod"):
@@ -195,12 +289,15 @@ class Relay:
         response = self.post(PUSH_URL, payload, {"X-TT-WS-OPENIDS": json.dumps([anchor])})
         # Keep unknown response formats pending until real cloud response is verified.
         if not isinstance(response, dict) or type(response.get("err_no")) is not int or response["err_no"] != 0:
-            raise RuntimeError("gateway acceptance not verified")
+            code = response.get("err_no") if isinstance(response, dict) else None
+            raise PushRejected("gateway_error", code if type(code) is int else None)
         data = response.get("data")
         # The gateway can report recipient failures even when err_no is zero.
         # Only an explicit empty failure list permits removal from the outbox.
-        if not isinstance(data, dict) or data.get("failed_open_id_list") != []:
-            raise RuntimeError("gateway acceptance not verified")
+        if not isinstance(data, dict) or not isinstance(data.get("failed_open_id_list"), list):
+            raise PushRejected("response_shape", 0)
+        if data["failed_open_id_list"]:
+            raise PushRejected("recipient_offline", 0, len(data["failed_open_id_list"]))
 
 
 def create_handler(relay):
@@ -268,7 +365,7 @@ def main():
                                socket_timeout=5, socket_connect_timeout=5)
     database.ping()
     environment = resolve_environment(os.environ)
-    store = RedisOutbox(database, environment)
+    store = RoomRedisOutbox(database, environment)
     relay = Relay(store, os.environ["DY_CALLBACK_SOURCE"], environment,
                   diagnostic=lambda record: print(json.dumps(record, separators=(",", ":")), flush=True))
     stop = threading.Event()
@@ -280,7 +377,10 @@ def main():
                     continue
             except Exception as exc:
                 # Never log request bodies, tokens, audience identifiers, or Redis URL.
-                print("outbox_retry", type(exc).__name__, flush=True)
+                record = {'event': 'outbox_retry', 'exception': type(exc).__name__}
+                if isinstance(exc, PushRejected):
+                    record.update(reason=exc.reason, errorCode=exc.code, failedRecipients=exc.failed_count)
+                print(json.dumps(record, separators=(',', ':')), flush=True)
             stop.wait(1)
 
     threading.Thread(target=worker, daemon=True).start()
@@ -294,4 +394,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
