@@ -6,6 +6,7 @@ must be internal-only in the cloud console. No AppSecret is used by this service
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -286,6 +287,47 @@ class Relay:
                 # a false failure. No request body or secret is used to recover.
                 pass
 
+    def record_safe(self, record):
+        if self.diagnostic is not None:
+            try:
+                self.diagnostic(record)
+            except Exception:
+                pass
+
+    def client_diagnostics(self, room, body):
+        # Strict schema: never let a caller smuggle IDs, text, or credentials
+        # into cloud logs. This endpoint cannot write game or ranking state.
+        booleans = ('active', 'canApply', 'canRender', 'connected', 'selfCheck')
+        counters = ('packets', 'outsideSession', 'malformed', 'queued', 'pendingAck', 'acks', 'ackRetries', 'startAttempts')
+        results = ('Applied', 'Duplicate', 'WrongRoom', 'Invalid', 'TestRejected', 'NotPlaying', 'NotJoined', 'UnknownGift', 'Ignored', 'CapacityReached')
+        fields = {'operation', 'schema', 'clientVersion', 'stage', 'protocolFailure', 'lastStartHttp', 'decoded', 'applied', 'results', 'tasks', *booleans, *counters}
+        stages = ('Unconfigured', 'Disabled', 'LocalReview', 'ConfigInvalid', 'Initializing', 'WaitingToken', 'WaitingRoom', 'Connecting', 'Connected', 'Reconnecting', 'InitFailed', 'Fatal', 'Stopped')
+        def count(value):
+            return type(value) is int and 0 <= value < 2**53
+        valid = isinstance(body, dict) and set(body) == fields
+        if valid:
+            valid = (type(body['schema']) is int and body['schema'] == 1
+                     and isinstance(body['clientVersion'], str) and re.fullmatch(r'[0-9]{1,3}(\.[0-9]{1,3}){2,3}', body['clientVersion']) is not None
+                     and body['stage'] in stages
+                     and body['protocolFailure'] in ('None', 'InvalidJson', 'PacketSize', 'RoomBinding', 'MessageType', 'EventArray', 'Other')
+                     and all(type(body[k]) is bool for k in booleans)
+                     and all(count(body[k]) for k in counters)
+                     and type(body['lastStartHttp']) is int and -1 <= body['lastStartHttp'] <= 599)
+        for key, names in (('decoded', TYPES), ('applied', TYPES), ('results', results), ('tasks', TYPES)):
+            values = body.get(key) if isinstance(body, dict) else None
+            valid = valid and isinstance(values, dict) and set(values) == set(names)
+            if valid:
+                valid = all(type(v) is int and v in (-1, 0, 1) for v in values.values()) if key == 'tasks' else all(count(v) for v in values.values())
+        if not valid:
+            return 400, {'ok': False, 'reason': 'diagnostic schema'}
+        # Across container instances, at most one compact record per room/5s.
+        key = self.round_keys(room)[0] + ':diagnostic-rate'
+        if self.store.redis.set(key, '1', nx=True, ex=5):
+            record = {k: v for k, v in body.items() if k != 'operation'}
+            record.update(event='client_diagnostics', environment=self.environment)
+            self.record_safe(record)
+        return 200, {'ok': True}
+
     def route(self, path, headers, body):
         if path == "/healthz":
             self.store.redis.ping()
@@ -307,13 +349,18 @@ class Relay:
             events = [encode_event(room, kind, row) for row in body]
             for event in events:
                 self.store.put(anchor, event)
+            self.record_safe({'event': 'callback_received', 'messageType': kind, 'accepted': len(events), 'environment': self.environment})
             return 200, {"ok": True, "accepted": len(events)}
         # These identity headers must be injected by the authenticated cloud gateway.
         if headers.get("x-tt-appid") != APP_ID or not identifier(headers.get("x-room-id"), 256) or not identifier(headers.get("x-anchor-openid")):
             return 403, {"ok": False, "reason": "gateway identity"}
         if path in ("/start_game", "/stop_game"):
+            if path == '/start_game' and isinstance(body, dict) and body.get('operation') == 'client_diagnostics':
+                return self.client_diagnostics(headers['x-room-id'], body)
             if path == '/start_game' and isinstance(body, dict) and body.get('operation') == 'round_state':
                 return self.save_round(headers['x-room-id'], body)
+            if not isinstance(body, dict) or body.get('operation') is not None:
+                return 400, {'ok': False, 'reason': 'operation'}
             # Both task operations are platform-idempotent. Never cache success:
             # partial failure or a lost response can safely retry all three types.
             url = TASK_URL if path == "/start_game" else STOP_TASK_URL
@@ -334,6 +381,8 @@ class Relay:
         if path == "/websocket_callback":
             if headers.get("x-tt-event-type") not in ("connect", "disconnect", "uplink"):
                 return 400, {"ok": False}
+            if headers['x-tt-event-type'] != 'uplink':
+                self.record_safe({'event': 'client_socket', 'state': headers['x-tt-event-type'], 'environment': self.environment})
             # Uplink cannot inject gifts, contributions, or settlement scores.
             return 200, {"ok": True}
         return 404, {"ok": False}
@@ -478,4 +527,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
